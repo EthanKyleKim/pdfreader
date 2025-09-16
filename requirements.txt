@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+pymupdf4llm
+sentence-transformers<3
+langchain-text-splitters
+requests
+pydantic-settings
+python-multipart
+supabase>=2.0.0
+python-dotenv

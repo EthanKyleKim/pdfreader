@@ -1,22 +1,28 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
+from typing import List, Dict, Any
 import os
 import uuid
 import requests
+from dotenv import load_dotenv
 
-import chromadb
-from chromadb.config import Settings
+from supabase import create_client, Client
 from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import pymupdf4llm
 
-PERSIST_DIR = os.path.join(os.path.dirname(__file__), "chroma")
-COLLECTION_NAME = "pdf_chunks"
+load_dotenv()
+
 EMBED_MODEL_NAME = os.environ.get("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 MODEL_NAME = os.environ.get("OLLAMA_MODEL", "exaone3.5:7.8b")
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+
+if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    raise ValueError("SUPABASE_URL and SUPABASE_ANON_KEY environment variables are required")
 
 app = FastAPI()
 app.add_middleware(
@@ -27,8 +33,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = chromadb.PersistentClient(path=PERSIST_DIR, settings=Settings(allow_reset=True))
-collection = client.get_or_create_collection(name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 embedder = SentenceTransformer(EMBED_MODEL_NAME)
 
 
@@ -59,19 +64,38 @@ def split_text(md: str) -> List[str]:
 
 @app.post("/ingest")
 async def ingest(file: UploadFile = File(...)):
-    content = await file.read()
-    md = pdf_to_markdown(content)
-    chunks = split_text(md)
+    try:
+        content = await file.read()
+        md = pdf_to_markdown(content)
+        chunks = split_text(md)
 
-    embeddings = embedder.encode(chunks, show_progress_bar=False, normalize_embeddings=True)
+        embeddings = embedder.encode(chunks, show_progress_bar=False, normalize_embeddings=True)
 
-    doc_id = str(uuid.uuid4())
-    ids = [f"{doc_id}_{i}" for i in range(len(chunks))]
-    metadatas = [{"doc_id": doc_id, "source_name": file.filename, "chunk_index": i} for i in range(len(chunks))]
+        doc_id = str(uuid.uuid4())
 
-    collection.add(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
+        # Prepare data for Supabase insertion
+        chunk_data = []
+        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+            chunk_data.append({
+                "id": f"{doc_id}_{i}",
+                "doc_id": doc_id,
+                "content": chunk,
+                "embedding": embedding.tolist(),  # Convert numpy array to list
+                "metadata": {"doc_id": doc_id, "source_name": file.filename, "chunk_index": i},
+                "source_name": file.filename,
+                "chunk_index": i
+            })
 
-    return {"ok": True, "doc_id": doc_id, "chunks": len(chunks)}
+        # Insert into Supabase
+        result = supabase.table("document_chunks").insert(chunk_data).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to insert chunks into database")
+
+        return {"ok": True, "doc_id": doc_id, "chunks": len(chunks)}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
 
 
 def build_prompt(question: str, contexts: List[str]) -> str:
@@ -88,31 +112,58 @@ def build_prompt(question: str, contexts: List[str]) -> str:
 
 @app.post("/ask")
 async def ask(payload: AskPayload):
-    q = payload.question.strip()
-    if not q:
-        return {"ok": False, "reason": "Empty question"}
+    try:
+        q = payload.question.strip()
+        if not q:
+            return {"ok": False, "reason": "Empty question"}
 
-    q_emb = embedder.encode([q], show_progress_bar=False, normalize_embeddings=True)[0]
-    results = collection.query(query_embeddings=[q_emb], n_results=payload.top_k)
+        # Generate query embedding
+        q_emb = embedder.encode([q], show_progress_bar=False, normalize_embeddings=True)[0]
 
-    contexts = results.get("documents", [[]])[0]
-    metadatas = results.get("metadatas", [[]])[0]
+        # Use Supabase RPC function for vector search
+        result = supabase.rpc(
+            "search_document_chunks",
+            {
+                "query_embedding": q_emb.tolist(),
+                "match_threshold": 0.1,  # Lower threshold for more results
+                "match_count": payload.top_k
+            }
+        ).execute()
 
-    prompt = build_prompt(q, contexts)
+        if not result.data:
+            return {"ok": False, "reason": "No relevant documents found"}
 
-    resp = requests.post(
-        f"{OLLAMA_URL}/api/generate",
-        json={"model": MODEL_NAME, "prompt": prompt, "stream": False},
-        timeout=120,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    answer = data.get("response", "")
+        # Extract contexts and metadata
+        contexts = [item["content"] for item in result.data]
+        metadatas = [
+            {
+                "doc_id": item["doc_id"],
+                "source_name": item["source_name"],
+                "chunk_index": item["chunk_index"],
+                "similarity": item["similarity"]
+            }
+            for item in result.data
+        ]
 
-    return {
-        "ok": True,
-        "answer": answer,
-        "contexts": contexts,
-        "metadatas": metadatas,
-        "model": MODEL_NAME,
-    }
+        prompt = build_prompt(q, contexts)
+
+        # Call Ollama for answer generation
+        resp = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": MODEL_NAME, "prompt": prompt, "stream": False},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        answer = data.get("response", "")
+
+        return {
+            "ok": True,
+            "answer": answer,
+            "contexts": contexts,
+            "metadatas": metadatas,
+            "model": MODEL_NAME,
+        }
+
+    except Exception as e:
+        return {"ok": False, "reason": f"Search failed: {str(e)}"}

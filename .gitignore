@@ -40,8 +40,7 @@ venv/
 .ruff_cache/
 build/
 
-# Project-specific (Chroma vector store binaries)
-backend/chroma/
+# Project-specific
 backend/__pycache__/
 
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
