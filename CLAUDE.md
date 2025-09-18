@@ -4,70 +4,68 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a PDF RAG (Retrieval-Augmented Generation) system with a unique hybrid architecture:
+This is a PDF RAG (Retrieval-Augmented Generation) system with a modern JavaScript-first architecture:
 - **Frontend**: Next.js 15 with App Router and TypeScript
-- **Backend**: FastAPI with Python serving /ingest and /ask endpoints
+- **Backend**: Next.js API routes with server-side processing
+- **PDF Processing**: JavaScript-based with pdf-parse library
+- **Embeddings**: Transformers.js with Xenova/all-MiniLM-L6-v2 model
 - **Vector DB**: Supabase with pgvector extension for embeddings storage
 - **LLM**: Local Ollama server for text generation
-- **Proxy Pattern**: Next.js API routes (`/api/ingest`, `/api/ask`) proxy to FastAPI
+- **Authentication**: Supabase OAuth (Google, GitHub)
 
 ## Development Commands
 
-### Primary Development
+### Development
 ```bash
-npm run dev          # Start both frontend and backend concurrently
-npm run dev:web      # Start only Next.js frontend
-npm run dev:api      # Start only FastAPI backend
-npm run stop         # Kill all development servers (ports 3000,3001,8000)
-```
-
-### Python Environment Setup
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-```
-
-### Build and Production
-```bash
+npm run dev          # Start Next.js development server
 npm run build        # Build Next.js for production
 npm run start        # Start Next.js production server
 npm run lint         # Run ESLint
 ```
 
+### Package Management
+```bash
+npm install          # Install all dependencies
+```
+
 ## Architecture and Data Flow
 
 ### Core Components
-1. **Frontend UI** (`src/app/page.tsx`) - PDF upload and Q&A interface
-2. **Next.js API Proxy** (`src/app/api/`) - CORS-safe proxy to FastAPI
-3. **FastAPI Backend** (`backend/main.py`) - PDF processing and vector operations
-4. **Supabase Database** - pgvector storage with `document_chunks` table
+1. **Frontend UI** (`src/app/page.tsx`) - Chat interface with sidebar and authentication
+2. **Authentication** (`src/components/AuthWrapper.tsx`) - Supabase OAuth integration
+3. **Chat Interface** (`src/components/ChatInterface.tsx`) - PDF upload and Q&A interface
+4. **Sidebar** (`src/components/Sidebar.tsx`) - Chat history and session management
+5. **JavaScript APIs** (`src/app/api/`) - Server-side processing with Next.js
+6. **Core Libraries** (`src/lib/`) - PDF processing, embeddings, text chunking
+7. **Supabase Database** - pgvector storage with authentication and chat history
 
 ### Request Flow
-1. **PDF Ingestion**: Browser → `/api/ingest` → FastAPI `/ingest` → PDF→Markdown→Chunks→Embeddings → Supabase
-2. **Q&A**: Browser → `/api/ask` → FastAPI `/ask` → Vector Search → Ollama LLM → Response
+1. **Authentication**: Browser → Supabase OAuth → User session
+2. **PDF Ingestion**: Browser → `/api/ingest-js` → PDF processing → Text chunking → Embeddings → Supabase
+3. **Q&A**: Browser → `/api/ask-stream-js` → Vector search → Ollama LLM → SSE streaming response
 
 ### Key Implementation Details
-- **PDF Processing**: Uses `pymupdf4llm.to_markdown()` for conversion
-- **Text Chunking**: `RecursiveCharacterTextSplitter` with 1000 char chunks, 200 overlap
-- **Embeddings**: `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions)
+- **PDF Processing**: Uses `pdf-parse` library for text extraction
+- **Text Chunking**: Custom JavaScript implementation with Korean language support
+- **Embeddings**: Transformers.js with `Xenova/all-MiniLM-L6-v2` (384 dimensions)
 - **Vector Search**: Supabase RPC function `search_document_chunks` with cosine similarity
-- **LLM Integration**: Direct HTTP calls to Ollama `/api/generate` endpoint
+- **LLM Integration**: Direct HTTP calls to Ollama `/api/generate` with streaming support
+- **Authentication**: Supabase Auth with Google and GitHub OAuth providers
 
 ## Environment Configuration
 
 ### Required Files
-- `.env` - Backend configuration (Supabase, Ollama, embedding model)
-- `.env.local` - Frontend configuration (backend URL)
+- `.env.local` - Configuration for Next.js and Supabase
 
 ### Critical Environment Variables
 ```bash
-# .env (required for backend)
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_ANON_KEY=your_anon_key
+# .env.local (required)
+NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your_anon_key
 
-# .env.local (required for frontend)
-NEXT_PUBLIC_BACKEND_URL=http://127.0.0.1:8000
+# Optional Ollama configuration
+OLLAMA_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=exaone3.5:7.8b
 ```
 
 ### Supabase Setup Requirements
@@ -79,38 +77,45 @@ NEXT_PUBLIC_BACKEND_URL=http://127.0.0.1:8000
 
 ## Common Issues and Solutions
 
-### "No such file or directory: .venv/bin/python"
-- Python virtual environment missing
-- Run: `python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt`
-
 ### "SUPABASE_URL and SUPABASE_ANON_KEY environment variables are required"
-- Missing or invalid `.env` file
-- Copy `.env.example` to `.env` and fill in real Supabase credentials
+- Missing or invalid `.env.local` file
+- Ensure `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` are set correctly
 
-### 500 errors on /ingest or /ask endpoints
+### 500 errors on /ingest-js or /ask-js endpoints
 - Supabase connection issues (check credentials)
 - Missing `document_chunks` table (run `supabase_schema.sql`)
 - pgvector extension not enabled (run `CREATE EXTENSION vector;`)
 
-### Frontend can't reach backend
-- Missing `.env.local` file
-- Backend not running (check `npm run dev` starts both services)
-- Port conflicts (use `npm run stop` to clean up)
+### "Failed to load model" errors
+- Transformers.js model loading issues
+- Check internet connection (models are downloaded from HuggingFace Hub)
+- Clear browser cache if running in development
+
+### Authentication errors
+- OAuth provider not configured in Supabase
+- Redirect URLs not set correctly
+- Missing authentication tables (run `supabase_auth_schema.sql`)
 
 ## Development Notes
 
-### Concurrency Pattern
-The project uses `concurrently` to run both Next.js and FastAPI simultaneously. Both must be running for full functionality.
+### JavaScript-First Architecture
+The project uses a pure JavaScript stack with Next.js handling both frontend and backend concerns through API routes.
 
-### API Contract Preservation
-When modifying backend endpoints, maintain the existing response format:
-- `/ingest`: `{ ok: boolean, doc_id: string, chunks: number }`
-- `/ask`: `{ ok: boolean, answer?: string, contexts?: string[], metadatas?: any[], model?: string, reason?: string }`
+### API Response Formats
+- `/api/ingest-js`: `{ ok: boolean, doc_id: string, chunks: number, processing_time: number, metadata: object }`
+- `/api/ask-js`: `{ ok: boolean, answer?: string, contexts?: string[], metadatas?: any[], model?: string, stats?: object }`
+- `/api/ask-stream-js`: Server-Sent Events with `{ type: 'content'|'sources'|'done'|'error', content?: string, sources?: any[] }`
 
 ### Vector Dimension Consistency
 The embedding model produces 384-dimensional vectors. If changing models, update the Supabase schema `VECTOR(384)` accordingly.
 
 ### Error Handling Strategy
-- FastAPI uses HTTPException with detailed error messages
-- Next.js API routes proxy errors with appropriate status codes
-- Frontend should handle both network and application errors gracefully
+- Next.js API routes return structured error responses with `{ ok: false, reason: string }` format
+- Frontend handles both network errors and application errors gracefully
+- Streaming endpoints use SSE error events for error communication
+
+### Performance Considerations
+- Transformers.js models are cached in browser/Node.js memory
+- First model load takes longer (model download from HuggingFace Hub)
+- PDF processing is done server-side for better performance
+- Embedding generation is batched for efficiency

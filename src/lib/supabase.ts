@@ -1,48 +1,96 @@
-import { createBrowserClient, createServerClient } from '@supabase/ssr'
-import { getCookie, setCookie } from 'cookies-next'
+import { createBrowserClient } from '@supabase/ssr'
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-
-// 브라우저용 Supabase 클라이언트
-export const createClient = () => {
-  return createBrowserClient(supabaseUrl, supabaseAnonKey)
-}
-
-// 서버용 Supabase 클라이언트 (SSR/API Routes)
-export const createServerSupabaseClient = () => {
-  return createServerClient(
-    supabaseUrl,
-    supabaseAnonKey,
-    {
-      cookies: {
-        get(name: string) {
-          return getCookie(name)
-        },
-        set(name: string, value: string, options: any) {
-          setCookie(name, value, options)
-        },
-        remove(name: string, options: any) {
-          setCookie(name, '', { ...options, maxAge: 0 })
-        },
-      },
-    }
+export function createClient() {
+  return createBrowserClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
   )
 }
 
-// 사용자 타입 정의
-export interface User {
-  id: string
-  email?: string
-  user_metadata?: {
-    full_name?: string
-    avatar_url?: string
+export type Database = {
+  public: {
+    Tables: {
+      chat_sessions: {
+        Row: {
+          id: string
+          user_id: string
+          title: string
+          created_at: string
+          updated_at: string
+        }
+        Insert: {
+          id?: string
+          user_id: string
+          title?: string
+          created_at?: string
+          updated_at?: string
+        }
+        Update: {
+          id?: string
+          user_id?: string
+          title?: string
+          created_at?: string
+          updated_at?: string
+        }
+      }
+      chat_messages: {
+        Row: {
+          id: string
+          session_id: string
+          user_id: string
+          role: 'user' | 'assistant'
+          content: string
+          sources: any[]
+          created_at: string
+        }
+        Insert: {
+          id?: string
+          session_id: string
+          user_id: string
+          role: 'user' | 'assistant'
+          content: string
+          sources?: any[]
+          created_at?: string
+        }
+        Update: {
+          id?: string
+          session_id?: string
+          user_id?: string
+          role?: 'user' | 'assistant'
+          content?: string
+          sources?: any[]
+          created_at?: string
+        }
+      }
+      user_documents: {
+        Row: {
+          id: string
+          user_id: string
+          session_id: string
+          filename: string
+          doc_id: string
+          chunks_count: number
+          uploaded_at: string
+        }
+        Insert: {
+          id?: string
+          user_id: string
+          session_id: string
+          filename: string
+          doc_id: string
+          chunks_count?: number
+          uploaded_at?: string
+        }
+        Update: {
+          id?: string
+          user_id?: string
+          session_id?: string
+          filename?: string
+          doc_id?: string
+          chunks_count?: number
+          uploaded_at?: string
+        }
+      }
+    }
   }
-}
-
-// 세션 타입 정의
-export interface Session {
-  access_token: string
-  refresh_token: string
-  user: User
 }
