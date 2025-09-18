@@ -13,12 +13,14 @@ CREATE TABLE IF NOT EXISTS document_chunks (
     metadata JSONB DEFAULT '{}',
     source_name TEXT,
     chunk_index INTEGER,
+    user_id TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Create indexes for performance
 CREATE INDEX IF NOT EXISTS idx_document_chunks_doc_id ON document_chunks(doc_id);
+CREATE INDEX IF NOT EXISTS idx_document_chunks_user_id ON document_chunks(user_id);
 CREATE INDEX IF NOT EXISTS idx_document_chunks_created_at ON document_chunks(created_at);
 
 -- Create vector similarity search index (HNSW for cosine similarity)

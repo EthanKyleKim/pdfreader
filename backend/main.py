@@ -1,169 +1,309 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Dict, Any
+"""
+FastAPI 백엔드 서버 - PDF 처리 전용
+"""
 import os
-import uuid
-import requests
+import logging
+from typing import Optional, Dict, Any, List
+
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
+import uvicorn
 from dotenv import load_dotenv
 
-from supabase import create_client, Client
-from sentence_transformers import SentenceTransformer
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-import pymupdf4llm
+from pdf_processor import process_pdf_file
+from ask_handler import ask_handler, QuestionRequest
 
+# 환경 변수 로드
 load_dotenv()
 
-EMBED_MODEL_NAME = os.environ.get("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
-MODEL_NAME = os.environ.get("OLLAMA_MODEL", "exaone3.5:7.8b")
+# 로깅 설정
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+# FastAPI 앱 생성
+app = FastAPI(
+    title="PDF RAG Backend",
+    description="PDF 처리 및 텍스트 추출을 위한 백엔드 API",
+    version="1.0.0"
+)
 
-if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-    raise ValueError("SUPABASE_URL and SUPABASE_ANON_KEY environment variables are required")
-
-app = FastAPI()
+# CORS 설정
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000", "http://localhost:3001"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-embedder = SentenceTransformer(EMBED_MODEL_NAME)
+# 응답 모델
+class ProcessResponse(BaseModel):
+    ok: bool
+    text: Optional[str] = None
+    chunks: Optional[List[str]] = None
+    metadata: Optional[Dict[str, Any]] = None
+    processing_time: Optional[float] = None
+    method: Optional[str] = None
+    reason: Optional[str] = None
 
+class HealthResponse(BaseModel):
+    status: str
+    message: str
+    version: str
 
-class AskPayload(BaseModel):
-    question: str
-    top_k: int = 5
+# 환경 변수
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:3001')
+MAX_FILE_SIZE = int(os.getenv('MAX_PDF_SIZE_MB', '50'))
 
-
-def pdf_to_markdown(file_bytes: bytes) -> str:
-    tmp_path = f"/tmp/{uuid.uuid4()}.pdf"
-    with open(tmp_path, "wb") as f:
-        f.write(file_bytes)
-    try:
-        md = pymupdf4llm.to_markdown(tmp_path)
-        return md
-    finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-
-
-def split_text(md: str) -> List[str]:
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    chunks = splitter.split_text(md)
-    return chunks
-
-
-@app.post("/ingest")
-async def ingest(file: UploadFile = File(...)):
-    try:
-        content = await file.read()
-        md = pdf_to_markdown(content)
-        chunks = split_text(md)
-
-        embeddings = embedder.encode(chunks, show_progress_bar=False, normalize_embeddings=True)
-
-        doc_id = str(uuid.uuid4())
-
-        # Prepare data for Supabase insertion
-        chunk_data = []
-        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-            chunk_data.append({
-                "id": f"{doc_id}_{i}",
-                "doc_id": doc_id,
-                "content": chunk,
-                "embedding": embedding.tolist(),  # Convert numpy array to list
-                "metadata": {"doc_id": doc_id, "source_name": file.filename, "chunk_index": i},
-                "source_name": file.filename,
-                "chunk_index": i
-            })
-
-        # Insert into Supabase
-        result = supabase.table("document_chunks").insert(chunk_data).execute()
-
-        if not result.data:
-            raise HTTPException(status_code=500, detail="Failed to insert chunks into database")
-
-        return {"ok": True, "doc_id": doc_id, "chunks": len(chunks)}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
-
-
-def build_prompt(question: str, contexts: List[str]) -> str:
-    context_block = "\n\n".join([f"- {c}" for c in contexts])
-    prompt = (
-        "당신은 주어진 컨텍스트로만 답하는 한국어 어시스턴트입니다.\n"
-        "모르면 모른다고 답하세요. 추측하지 마세요.\n\n"
-        f"컨텍스트:\n{context_block}\n\n"
-        f"질문: {question}\n\n"
-        "한국어로 간결하고 정확하게 답변하세요."
+@app.get("/", response_model=HealthResponse)
+async def root():
+    """서버 상태 확인"""
+    return HealthResponse(
+        status="healthy",
+        message="PDF RAG Backend API Server",
+        version="1.0.0"
     )
-    return prompt
 
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """헬스 체크 엔드포인트"""
+    return HealthResponse(
+        status="healthy",
+        message="All systems operational",
+        version="1.0.0"
+    )
 
-@app.post("/ask")
-async def ask(payload: AskPayload):
+@app.post("/ingest", response_model=ProcessResponse)
+async def ingest_pdf(
+    file: UploadFile = File(...),
+    user_id: Optional[str] = Form(None),
+    method: str = Form("auto")
+):
+    """
+    PDF 파일을 처리하여 텍스트를 추출합니다.
+
+    Args:
+        file: PDF 파일
+        user_id: 사용자 ID (선택사항)
+        method: 추출 방법 (auto, pymupdf4llm, structured, basic)
+
+    Returns:
+        추출된 텍스트와 메타데이터
+    """
+    import time
+    start_time = time.time()
+
     try:
-        q = payload.question.strip()
-        if not q:
-            return {"ok": False, "reason": "Empty question"}
+        logger.info(f"📁 PDF 처리 요청: {file.filename} ({user_id})")
 
-        # Generate query embedding
-        q_emb = embedder.encode([q], show_progress_bar=False, normalize_embeddings=True)[0]
+        # 파일 검증
+        if not file.filename:
+            raise HTTPException(
+                status_code=400,
+                detail="파일명이 제공되지 않았습니다"
+            )
 
-        # Use Supabase RPC function for vector search
-        result = supabase.rpc(
-            "search_document_chunks",
-            {
-                "query_embedding": q_emb.tolist(),
-                "match_threshold": 0.1,  # Lower threshold for more results
-                "match_count": payload.top_k
-            }
-        ).execute()
+        if not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(
+                status_code=400,
+                detail="PDF 파일만 지원됩니다"
+            )
 
-        if not result.data:
-            return {"ok": False, "reason": "No relevant documents found"}
+        # 파일 크기 확인
+        if file.size and file.size > MAX_FILE_SIZE * 1024 * 1024:
+            raise HTTPException(
+                status_code=413,
+                detail=f"파일이 너무 큽니다. 최대 {MAX_FILE_SIZE}MB까지 지원합니다"
+            )
 
-        # Extract contexts and metadata
-        contexts = [item["content"] for item in result.data]
-        metadatas = [
-            {
-                "doc_id": item["doc_id"],
-                "source_name": item["source_name"],
-                "chunk_index": item["chunk_index"],
-                "similarity": item["similarity"]
-            }
-            for item in result.data
-        ]
+        # PDF 파일 읽기
+        pdf_bytes = await file.read()
 
-        prompt = build_prompt(q, contexts)
+        if not pdf_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail="빈 파일입니다"
+            )
 
-        # Call Ollama for answer generation
-        resp = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={"model": MODEL_NAME, "prompt": prompt, "stream": False},
-            timeout=120,
+        logger.info(f"📄 파일 크기: {len(pdf_bytes) / 1024 / 1024:.2f}MB")
+
+        # PDF 처리
+        try:
+            result = process_pdf_file(
+                pdf_bytes=pdf_bytes,
+                filename=file.filename,
+                method=method
+            )
+        except ValueError as e:
+            logger.error(f"PDF 처리 오류: {str(e)}")
+            raise HTTPException(
+                status_code=400,
+                detail=str(e)
+            )
+        except Exception as e:
+            logger.error(f"PDF 처리 실패: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"PDF 처리 중 오류가 발생했습니다: {str(e)}"
+            )
+
+        processing_time = time.time() - start_time
+
+        logger.info(
+            f"✅ PDF 처리 완료: {file.filename} "
+            f"({result['chunk_count']}개 청크, {processing_time:.2f}초, {result['extraction_method']})"
         )
-        resp.raise_for_status()
-        data = resp.json()
-        answer = data.get("response", "")
 
+        # JavaScript 임베딩 서비스에 전달하기 위한 응답 (새로운 청킹 형식)
         return {
             "ok": True,
-            "answer": answer,
-            "contexts": contexts,
-            "metadatas": metadatas,
-            "model": MODEL_NAME,
+            "chunks": result['chunks'],
+            "metadata": {
+                **result['metadata'],
+                'extraction_method': result['extraction_method'],
+                'file_size_mb': len(pdf_bytes) / 1024 / 1024,
+                'chunk_count': result['chunk_count'],
+            },
+            "processing_time": processing_time,
+            "method": result['extraction_method']
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"ok": False, "reason": f"Search failed: {str(e)}"}
+        logger.error(f"❌ 예상치 못한 오류: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"서버 오류가 발생했습니다: {str(e)}"
+        )
+
+@app.post("/extract-text", response_model=ProcessResponse)
+async def extract_text_only(
+    file: UploadFile = File(...),
+    method: str = Form("auto")
+):
+    """
+    PDF에서 텍스트만 추출 (임베딩/저장 없이)
+    """
+    import time
+    start_time = time.time()
+
+    try:
+        logger.info(f"📄 텍스트 추출 요청: {file.filename}")
+
+        # 파일 검증
+        if not file.filename or not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(
+                status_code=400,
+                detail="PDF 파일만 지원됩니다"
+            )
+
+        # PDF 파일 읽기
+        pdf_bytes = await file.read()
+
+        # PDF 처리
+        result = process_pdf_file(
+            pdf_bytes=pdf_bytes,
+            filename=file.filename,
+            method=method
+        )
+
+        processing_time = time.time() - start_time
+
+        logger.info(f"✅ 텍스트 추출 완료: {len(result['text'])}자")
+
+        return ProcessResponse(
+            ok=True,
+            text=result['text'],
+            metadata=result['metadata'],
+            processing_time=processing_time,
+            method=result['extraction_method']
+        )
+
+    except Exception as e:
+        logger.error(f"❌ 텍스트 추출 실패: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"텍스트 추출 실패: {str(e)}"
+        )
+
+@app.get("/ask-stream")
+async def ask_question_stream(
+    question: str,
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    top_k: int = 5
+):
+    """
+    질문에 대한 스트리밍 답변 생성
+    """
+    logger.info(f"🌊 스트리밍 질문 답변 요청: {question}")
+
+    if not question.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "reason": "질문이 제공되지 않았습니다"}
+        )
+
+    request = QuestionRequest(
+        question=question,
+        session_id=session_id,
+        user_id=user_id,
+        top_k=top_k
+    )
+
+    return StreamingResponse(
+        ask_handler.stream_response(request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
+        }
+    )
+
+# 에러 핸들러
+@app.exception_handler(404)
+async def not_found_handler(request, exc):
+    return JSONResponse(
+        status_code=404,
+        content={
+            "ok": False,
+            "reason": "요청한 엔드포인트를 찾을 수 없습니다"
+        }
+    )
+
+@app.exception_handler(500)
+async def internal_error_handler(request, exc):
+    logger.error(f"Internal server error: {str(exc)}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "ok": False,
+            "reason": "서버 내부 오류가 발생했습니다"
+        }
+    )
+
+if __name__ == "__main__":
+    # 개발 서버 실행
+    port = int(os.getenv('PORT', '8000'))
+    host = os.getenv('HOST', '127.0.0.1')
+
+    logger.info(f"🚀 PDF RAG Backend 서버 시작: http://{host}:{port}")
+    logger.info(f"📄 최대 파일 크기: {MAX_FILE_SIZE}MB")
+    logger.info(f"🔗 프론트엔드 URL: {FRONTEND_URL}")
+
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        reload=True,
+        log_level="info"
+    )
